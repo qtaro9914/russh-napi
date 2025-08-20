@@ -14,7 +14,11 @@ log = "0.4"
 napi = { version = "=3.0.0-alpha.24", features = ["async"] }
 napi-derive = "=3.0.0-alpha.24"
 tokio = { version = "1.17.0", features = ["macros", "process"] }
-russh = { version = "0.54.2" }
+russh = { version = "0.54.2", default-features = false, features = [
+    "ring",
+    "rsa",
+    "flate2",
+] }
 # russh = { version = "0.50.0-beta.12", path = "../russh/russh" }
 pageant = { version = "0.0.2" }
 futures = "0.3"
