@@ -1,6 +1,6 @@
 {
   "name": "russh",
-  "version": "0.1.24+0.51.0-beta.3",
+  "version": "0.1.25+0.54.2",
   "main": "lib/index.js",
   "license": "Apache-2.0",
   "dependencies": {
