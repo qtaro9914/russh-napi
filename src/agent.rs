@@ -38,7 +38,7 @@ pub async fn get_agent_client(
     match connection.kind {
         AgentConnectionKind::Pageant => {
             #[cfg(windows)]
-            return Ok(AgentClient::connect_pageant().await.dynamic());
+            return Ok(AgentClient::connect_pageant()?.await.dynamic());
             #[cfg(not(windows))]
             Err(russh::keys::Error::AgentFailure.into())
         }
@@ -46,7 +46,7 @@ pub async fn get_agent_client(
             #[cfg(windows)]
             return Ok(AgentClient::connect_named_pipe(
                 &connection.path.clone().unwrap_or_default(),
-            )
+            )?
             .await
             .map_err(WrappedError::from)?
             .dynamic());
