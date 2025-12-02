@@ -48,7 +48,6 @@ pub async fn get_agent_client(
                 &connection.path.clone().unwrap_or_default(),
             )
             .await?
-            .map_err(WrappedError::from)?
             .dynamic());
             #[cfg(not(windows))]
             Err(russh::keys::Error::AgentFailure.into())
