@@ -90,7 +90,7 @@ pub fn is_pageant_running() -> bool {
 #[napi]
 pub fn parse_public_key(data: String) -> napi::Result<SshPublicKey> {
     russh::keys::PublicKey::from_openssh(&data)
-        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("Failed to parse public key: {}", e)))
+        .map_err(|e| WrappedError::from(russh::Error::from(e)).into())
         .map(|key| SshPublicKey { inner: key })
 }
 
