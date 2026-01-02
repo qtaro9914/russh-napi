@@ -173,6 +173,31 @@ export class SSHClient extends Destructible {
         return result
     }
 
+    /**
+     * Authenticate using SSH agent with a specific public key identity.
+     * This is useful when you have multiple keys in the agent and want to use a specific one,
+     * avoiding the server's authentication attempt limit.
+     * @param username SSH username
+     * @param connection Agent connection specification
+     * @param publicKey The specific public key to use for authentication
+     */
+    async authenticateWithAgentIdentity(
+        username: string,
+        connection: AgentConnectionSpec,
+        publicKey: SshPublicKey,
+    ): Promise<AuthenticatedSSHClient | AuthFailure> {
+        this.assertNotDestructed()
+        const result = await this.client.authenticateAgentWithIdentity(
+            username,
+            makeRusshAgentConnection(connection),
+            publicKey,
+        )
+        if (result.success) {
+            return this.intoAuthenticated()
+        }
+        return result
+    }
+
     async disconnect(): Promise<void> {
         this.destruct()
         await this.client.disconnect()
@@ -289,6 +314,7 @@ export {
     SftpFile as SFTPFile,
     isPageantRunning,
     HashAlgorithm,
+    parsePublicKey,
 } from './native'
 export {
     SFTP, SFTPDirectoryEntry, SFTPMetadata,

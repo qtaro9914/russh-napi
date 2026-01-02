@@ -85,3 +85,17 @@ pub fn is_pageant_running() -> bool {
     #[cfg(unix)]
     false
 }
+
+/// Parse a public key from OpenSSH format string (e.g., "ssh-ed25519 AAAA... comment")
+#[napi]
+pub fn parse_public_key(data: String) -> napi::Result<SshPublicKey> {
+    russh::keys::PublicKey::from_openssh(&data)
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("Failed to parse public key: {}", e)))
+        .map(|key| SshPublicKey { inner: key })
+}
+
+impl SshPublicKey {
+    pub fn inner(&self) -> &russh::keys::PublicKey {
+        &self.inner
+    }
+}
