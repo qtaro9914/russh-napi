@@ -421,15 +421,22 @@ impl SshClient {
         &self,
         username: String,
         connection: &AgentConnection,
+        specific_key: Option<&SshPublicKey>,
     ) -> napi::Result<SshAuthResult> {
         let mut handle = self.handle.lock().await;
 
         let mut agent = get_agent_client(connection).await?;
 
-        let keys = agent
-            .request_identities()
-            .await
-            .map_err(WrappedError::from)?;
+        let keys = match specific_key {
+            Some(k) => {
+                debug!("Trying specified key {:?}", k.inner());
+                vec![k.inner().clone()]
+            }
+            None => agent
+                .request_identities()
+                .await
+                .map_err(WrappedError::from)?,
+        };
 
         let mut last_auth_result = AuthResult::Failure {
             remaining_methods: MethodSet::empty(),
