@@ -421,15 +421,22 @@ impl SshClient {
         &self,
         username: String,
         connection: &AgentConnection,
+        specific_key: Option<&SshPublicKey>,
     ) -> napi::Result<SshAuthResult> {
         let mut handle = self.handle.lock().await;
 
         let mut agent = get_agent_client(connection).await?;
 
-        let keys = agent
-            .request_identities()
-            .await
-            .map_err(WrappedError::from)?;
+        let keys = match specific_key {
+            Some(k) => {
+                debug!("Trying specified key {:?}", k.inner());
+                vec![k.inner().clone()]
+            }
+            None => agent
+                .request_identities()
+                .await
+                .map_err(WrappedError::from)?,
+        };
 
         let mut last_auth_result = AuthResult::Failure {
             remaining_methods: MethodSet::empty(),
@@ -455,36 +462,6 @@ impl SshClient {
         }
 
         Ok(last_auth_result.into())
-    }
-
-    /// Authenticate using SSH agent with a specific public key identity.
-    /// This is useful when you have multiple keys in the agent and want to use a specific one,
-    /// avoiding the server's authentication attempt limit.
-    #[napi]
-    pub async fn authenticate_agent_with_identity(
-        &self,
-        username: String,
-        connection: &AgentConnection,
-        public_key: &SshPublicKey,
-    ) -> napi::Result<SshAuthResult> {
-        let mut handle = self.handle.lock().await;
-
-        let mut agent = get_agent_client(connection).await?;
-
-        let best_hash = handle
-            .best_supported_rsa_hash()
-            .await
-            .map_err(|e| napi::Error::from(WrappedError::from(e)))?
-            .flatten();
-
-        debug!("Trying specified key {:?}", public_key.inner());
-        let result = handle
-            .authenticate_publickey_with(&username, public_key.inner().clone(), best_hash, &mut agent)
-            .await;
-
-        result
-            .map_err(|e| napi::Error::from(WrappedError::from(e)))
-            .map(Into::into)
     }
 
     #[napi]

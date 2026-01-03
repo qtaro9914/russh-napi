@@ -166,6 +166,7 @@ export class SSHClient extends Destructible {
         const result = await this.client.authenticateAgent(
             username,
             makeRusshAgentConnection(connection),
+            null,
         )
         if (result.success) {
             return this.intoAuthenticated()
@@ -187,7 +188,7 @@ export class SSHClient extends Destructible {
         publicKey: SshPublicKey,
     ): Promise<AuthenticatedSSHClient | AuthFailure> {
         this.assertNotDestructed()
-        const result = await this.client.authenticateAgentWithIdentity(
+        const result = await this.client.authenticateAgent(
             username,
             makeRusshAgentConnection(connection),
             publicKey,
