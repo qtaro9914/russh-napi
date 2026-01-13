@@ -1,4 +1,3 @@
-import { filter, map } from 'rxjs'
 import * as russh from './native'
 import { ClientEventInterface } from './events'
 import { Destructible } from "./helpers"
@@ -21,12 +20,17 @@ export interface SFTPDirectoryEntry {
 }
 
 export class SFTP extends Destructible {
-    readonly closed$ = this.events.close$.pipe(filter(channel => channel === this.inner.channelId), map(() => { }))
+    readonly closed$ = this.events.close$.subscribe(this.inner.channelId)
 
     constructor (
         private inner: russh.SftpChannel,
         private events: ClientEventInterface,
-    ) { super() }
+    ) {
+        super()
+        // Trigger subscriptions to stop buffering data
+        this.events.data$.subscribe(this.inner.channelId).subscribe().unsubscribe()
+        this.events.extendedData$.subscribe(this.inner.channelId).subscribe().unsubscribe()
+    }
 
     async createDirectory (path: string): Promise<void> {
         this.assertNotDestructed()

@@ -1,5 +1,5 @@
 import * as russh from './native'
-import { Observable, filter, map } from 'rxjs'
+import { Observable } from 'rxjs'
 import { Destructible } from './helpers'
 import { ClientEventInterface } from './events'
 
@@ -42,10 +42,10 @@ export class Channel extends Destructible {
         events: ClientEventInterface,
     ) {
         super()
-        this.data$ = events.data$.pipe(filter(([channel]) => channel === id), map(([_, data]) => data))
-        this.extendedData$ = events.extendedData$.pipe(filter(([channel]) => channel === id), map(([_, ext, data]) => [ext, data]))
-        this.eof$ = events.eof$.pipe(filter(channel => channel === id), map(() => { }))
-        this.closed$ = events.close$.pipe(filter(channel => channel === id), map(() => { }))
+        this.data$ = events.data$.subscribe(id)
+        this.extendedData$ = events.extendedData$.subscribe(id)
+        this.eof$ = events.eof$.subscribe(id)
+        this.closed$ = events.close$.subscribe(id)
     }
 
     async take(): Promise<russh.SshChannel> {
