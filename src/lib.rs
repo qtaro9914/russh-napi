@@ -476,7 +476,7 @@ impl SshClient {
 
     #[napi]
     pub async fn tcpip_forward(&self, address: String, port: u32) -> napi::Result<u32> {
-        let mut handle = self.handle.lock().await;
+        let handle = self.handle.lock().await;
         let port = handle
             .tcpip_forward(address, port)
             .await
