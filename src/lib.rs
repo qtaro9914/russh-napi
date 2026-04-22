@@ -12,6 +12,7 @@ use napi::module_init;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use russh::client::{AuthResult, DisconnectReason};
+use russh::keys::agent::AgentIdentity;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::{ChannelId, MethodSet};
 use tokio::sync::Mutex;
@@ -430,7 +431,7 @@ impl SshClient {
         let keys = match specific_key {
             Some(k) => {
                 debug!("Trying specified key {:?}", k.inner());
-                vec![k.inner().clone()]
+                vec![k.inner().clone().into()]
             }
             None => agent
                 .request_identities()
@@ -451,9 +452,23 @@ impl SshClient {
 
         for key in keys {
             debug!("Trying key {key:?}");
-            let result = handle
-                .authenticate_publickey_with(&username, key.clone(), best_hash, &mut agent)
-                .await;
+            let result = match key {
+                AgentIdentity::PublicKey { key, .. } => {
+                    handle
+                        .authenticate_publickey_with(&username, key.clone(), best_hash, &mut agent)
+                        .await
+                }
+                AgentIdentity::Certificate { certificate, .. } => {
+                    handle
+                        .authenticate_certificate_with(
+                            &username,
+                            certificate,
+                            best_hash,
+                            &mut agent,
+                        )
+                        .await
+                }
+            };
             let ret = result.map_err(|e| napi::Error::from(WrappedError::from(e)))?;
             if ret.success() {
                 return Ok(ret.into());
