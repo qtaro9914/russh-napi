@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use napi::bindgen_prelude::Uint8Array;
 use napi_derive::napi;
+use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::fs::DirEntry;
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
@@ -130,6 +131,49 @@ impl SftpFile {
             .await
             .map_err(WrappedError::from)?;
         Ok(Uint8Array::from(&buf[..len]))
+    }
+
+    /// Reads up to `n` bytes at the given absolute file offset.
+    ///
+    /// Unlike `read`, this does not use (or advance) the file cursor and is
+    /// issued as a single protocol-level READ, so multiple `readAt` calls
+    /// may be safely in flight concurrently — responses are matched by
+    /// request id. Returns an empty array on EOF. May return fewer bytes
+    /// than requested (e.g. when `n` exceeds the server's per-request
+    /// read limit).
+    #[napi]
+    pub async fn read_at(&self, offset: f64, n: u32) -> napi::Result<Uint8Array> {
+        // Only hold the file lock long enough to grab the raw session and
+        // handle — holding it across the network round-trip would serialize
+        // concurrent readAt calls and defeat pipelining
+        let (session, sftp_handle) = {
+            let handle = self.handle.lock().await;
+            (handle.raw_session(), handle.raw_handle().to_string())
+        };
+        // f64 offsets are exact up to 2^53 — far beyond realistic file sizes
+        let offset = offset.max(0.0) as u64;
+        // servers advertise a per-request read limit (limits@openssh.com);
+        // exceeding it is a hard client-side error, so clamp
+        let n = session
+            .configured_limits()
+            .read_len
+            .map_or(n, |limit| (n as u64).min(limit) as u32);
+        match session.read(sftp_handle, offset, n).await {
+            Ok(data) => Ok(Uint8Array::from(data.data)),
+            Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => {
+                Ok(Uint8Array::from(&[][..]))
+            }
+            Err(e) => Err(WrappedError::from(e).into()),
+        }
+    }
+
+    /// The server's per-request read length limit in bytes
+    /// (`limits@openssh.com`), if advertised. `readAt` requests larger than
+    /// this are clamped, so callers can use it to pick an optimal chunk size.
+    #[napi]
+    pub async fn read_limit(&self) -> Option<f64> {
+        let handle = self.handle.lock().await;
+        handle.raw_session().configured_limits().read_len.map(|l| l as f64)
     }
 
     #[napi]

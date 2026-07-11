@@ -2035,8 +2035,6 @@ dependencies = [
 [[package]]
 name = "russh-sftp"
 version = "2.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a72c8afe2041c17435eecd85d0b7291841486fd3d1c4082e0b212e5437ca42"
 dependencies = [
  "async-trait",
  "bitflags",

@@ -40,3 +40,6 @@ napi-build = "2"
 codegen-units = 1
 lto = "fat"
 panic = "abort"
+
+[patch.crates-io]
+russh-sftp = { path = "vendored/russh-sftp" }
