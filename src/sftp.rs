@@ -31,6 +31,10 @@ pub const OPEN_CREATE: u32 = OpenFlags::CREATE.bits();
 #[napi]
 pub const OPEN_TRUNCATE: u32 = OpenFlags::TRUNCATE.bits();
 
+/// russh-sftp's write length when the server doesn't advertise
+/// `limits@openssh.com` (matches its private `MAX_WRITE_LENGTH`)
+const DEFAULT_WRITE_LEN: u64 = 261120;
+
 #[napi]
 #[derive(Debug, Clone)]
 pub struct SftpFileMetadata {
@@ -174,6 +178,43 @@ impl SftpFile {
     pub async fn read_limit(&self) -> Option<f64> {
         let handle = self.handle.lock().await;
         handle.raw_session().configured_limits().read_len.map(|l| l as f64)
+    }
+
+    /// Writes all of `data` at the given absolute file offset.
+    ///
+    /// Unlike `writeAll`, this does not use (or advance) the file cursor.
+    /// Each protocol-level WRITE is matched by request id, so multiple
+    /// `writeAt` calls may be safely in flight concurrently. Data larger
+    /// than the server's per-request write limit is split into several
+    /// WRITEs, which are also issued concurrently. Resolves once every
+    /// byte has been acknowledged.
+    #[napi]
+    pub async fn write_at(&self, offset: f64, data: Uint8Array) -> napi::Result<()> {
+        // Same as readAt: don't hold the file lock across the round-trip
+        let (session, sftp_handle) = {
+            let handle = self.handle.lock().await;
+            (handle.raw_session(), handle.raw_handle().to_string())
+        };
+        // f64 offsets are exact up to 2^53 — far beyond realistic file sizes
+        let offset = offset.max(0.0) as u64;
+        // exceeding limits@openssh.com is a hard client-side error; without
+        // the extension fall back to russh-sftp's own default write length
+        let max_len = session
+            .configured_limits()
+            .write_len
+            .unwrap_or(DEFAULT_WRITE_LEN)
+            .max(1) as usize;
+        let writes = data.chunks(max_len).enumerate().map(|(i, piece)| {
+            session.write(
+                sftp_handle.clone(),
+                offset + (i * max_len) as u64,
+                piece.to_vec(),
+            )
+        });
+        futures::future::try_join_all(writes)
+            .await
+            .map_err(WrappedError::from)?;
+        Ok(())
     }
 
     #[napi]
