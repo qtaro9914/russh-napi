@@ -202,6 +202,11 @@ impl RawSftpSession {
         self.options.limits.clone()
     }
 
+    /// Number of sent requests whose reply hasn't been received yet
+    pub fn pending_requests(&self) -> usize {
+        self.requests.pin().len()
+    }
+
     async fn send(&self, id: Option<u32>, packet: Packet) -> SftpResult<Packet> {
         if self.tx.is_closed() {
             return Err(Error::UnexpectedBehavior("session closed".into()));
