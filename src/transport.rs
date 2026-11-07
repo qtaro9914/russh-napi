@@ -7,12 +7,13 @@ use std::task::{Context, Poll};
 use async_http_proxy::http_connect_tokio;
 use delegate::delegate;
 use napi_derive::napi;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::process::Child;
 use tokio::sync::Mutex;
 use tokio_socks::tcp::Socks5Stream;
 
+use crate::cancellation::{self, SshCancellation};
 use crate::channel::NewSshChannel;
 
 #[napi]
@@ -21,7 +22,7 @@ pub struct SshTransport(Arc<Mutex<Option<SshTransportInner>>>);
 
 pub(crate) enum SshTransportInner {
     Socket(TcpStream),
-    Command(Child),
+    Command(CommandTransport),
     SshChannel(russh::ChannelStream<russh::client::Msg>),
     SocksProxy(tokio_socks::tcp::socks5::Socks5Stream<TcpStream>),
 }
@@ -37,18 +38,18 @@ impl Debug for SshTransportInner {
     }
 }
 
-impl Drop for SshTransportInner {
+pub(crate) struct CommandTransport {
+    child: Option<Child>,
+    runtime: tokio::runtime::Handle,
+}
+impl Drop for CommandTransport {
     fn drop(&mut self) {
-        match self {
-            SshTransportInner::Socket(socket) => {
-                let _ = futures::executor::block_on(socket.shutdown());
-            }
-            SshTransportInner::Command(child) => {
-                let _ = futures::executor::block_on(child.kill());
-            }
-            SshTransportInner::SshChannel(_) | SshTransportInner::SocksProxy(_) => {
-                // just drop the stream
-            }
+        if let Some(mut child) = self.child.take() {
+            // Reap explicitly instead of relying on opportunistic orphan reaping.
+            let _ = child.start_kill();
+            self.runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
         }
     }
 }
@@ -56,41 +57,64 @@ impl Drop for SshTransportInner {
 #[napi]
 impl SshTransport {
     #[napi]
-    pub async fn new_socket(address: String) -> napi::Result<SshTransport> {
-        let socket = tokio::net::TcpStream::connect(address.clone()).await?;
-        socket.set_nodelay(true)?;
-        Ok(Self(Arc::new(Mutex::new(Some(SshTransportInner::Socket(
-            socket,
-        ))))))
+    pub async fn new_socket(
+        address: String,
+        cancellation: Option<&SshCancellation>,
+    ) -> napi::Result<SshTransport> {
+        cancellation::run(&cancellation::token(cancellation), async move {
+            let socket = tokio::net::TcpStream::connect(address.clone()).await?;
+            socket.set_nodelay(true)?;
+            Ok(Self(Arc::new(Mutex::new(Some(SshTransportInner::Socket(
+                socket,
+            ))))))
+        })
+        .await
     }
 
     #[napi]
-    pub async fn new_command(command: String, args: Vec<String>) -> napi::Result<SshTransport> {
-        let child = tokio::process::Command::new(command)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()?;
+    pub async fn new_command(
+        command: String,
+        args: Vec<String>,
+        cancellation: Option<&SshCancellation>,
+    ) -> napi::Result<SshTransport> {
+        cancellation::run(&cancellation::token(cancellation), async move {
+            let child = tokio::process::Command::new(command)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
 
-        Ok(Self(Arc::new(Mutex::new(Some(
-            SshTransportInner::Command(child),
-        )))))
+            Ok(Self(Arc::new(Mutex::new(Some(
+                SshTransportInner::Command(CommandTransport {
+                    child: Some(child),
+                    runtime: tokio::runtime::Handle::current(),
+                }),
+            )))))
+        })
+        .await
     }
 
     #[napi]
-    pub async fn new_ssh_channel(channel: &NewSshChannel) -> napi::Result<SshTransport> {
-        let Some(handle) = channel.take().await else {
-            return Err(napi::Error::new(
-                napi::Status::GenericFailure,
-                "Channel is already consumed",
-            ));
-        };
+    pub async fn new_ssh_channel(
+        channel: &NewSshChannel,
+        cancellation: Option<&SshCancellation>,
+    ) -> napi::Result<SshTransport> {
+        cancellation::run(&cancellation::token(cancellation), async move {
+            let Some(handle) = channel.take().await else {
+                return Err(napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "Channel is already consumed",
+                ));
+            };
 
-        let stream = handle.into_stream();
+            let stream = handle.into_stream();
 
-        Ok(Self(Arc::new(Mutex::new(Some(
-            SshTransportInner::SshChannel(stream),
-        )))))
+            Ok(Self(Arc::new(Mutex::new(Some(
+                SshTransportInner::SshChannel(stream),
+            )))))
+        })
+        .await
     }
 
     #[napi]
@@ -99,17 +123,21 @@ impl SshTransport {
         proxy_port: u16,
         target_host: String,
         target_port: u16,
+        cancellation: Option<&SshCancellation>,
     ) -> napi::Result<SshTransport> {
-        let stream = Socks5Stream::connect(
-            (proxy_host.as_ref(), proxy_port),
-            (target_host, target_port),
-        )
-        .await
-        .map_err(crate::WrappedError::from)?;
+        cancellation::run(&cancellation::token(cancellation), async move {
+            let stream = Socks5Stream::connect(
+                (proxy_host.as_ref(), proxy_port),
+                (target_host, target_port),
+            )
+            .await
+            .map_err(crate::WrappedError::from)?;
 
-        Ok(Self(Arc::new(Mutex::new(Some(
-            SshTransportInner::SocksProxy(stream),
-        )))))
+            Ok(Self(Arc::new(Mutex::new(Some(
+                SshTransportInner::SocksProxy(stream),
+            )))))
+        })
+        .await
     }
 
     #[napi]
@@ -118,16 +146,25 @@ impl SshTransport {
         proxy_port: u16,
         target_host: String,
         target_port: u16,
+        cancellation: Option<&SshCancellation>,
     ) -> napi::Result<SshTransport> {
-        let mut socket = tokio::net::TcpStream::connect((proxy_host, proxy_port)).await?;
-        socket.set_nodelay(true)?;
-        http_connect_tokio(&mut socket, target_host.as_str(), target_port)
-            .await
-            .map_err(crate::WrappedError::from)?;
+        cancellation::run(&cancellation::token(cancellation), async move {
+            let mut socket = tokio::net::TcpStream::connect((proxy_host, proxy_port)).await?;
+            socket.set_nodelay(true)?;
+            http_connect_tokio(&mut socket, target_host.as_str(), target_port)
+                .await
+                .map_err(crate::WrappedError::from)?;
 
-        Ok(Self(Arc::new(Mutex::new(Some(SshTransportInner::Socket(
-            socket,
-        ))))))
+            Ok(Self(Arc::new(Mutex::new(Some(SshTransportInner::Socket(
+                socket,
+            ))))))
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn close(&self) {
+        drop(self.0.lock().await.take());
     }
 
     pub(crate) async fn take(&self) -> Option<SshTransportInner> {
@@ -139,7 +176,7 @@ impl AsyncRead for SshTransportInner {
     delegate! {
         to match self.get_mut() {
             SshTransportInner::Socket(stream) => Pin::new(stream),
-            SshTransportInner::Command(child) => Pin::new(child.stdout.as_mut().unwrap()),
+            SshTransportInner::Command(child) => Pin::new(child.child.as_mut().unwrap().stdout.as_mut().unwrap()),
             SshTransportInner::SshChannel(stream) => Pin::new(stream),
             SshTransportInner::SocksProxy(stream) => Pin::new(stream),
         } {
@@ -156,7 +193,7 @@ impl AsyncWrite for SshTransportInner {
     delegate! {
         to match self.get_mut() {
             SshTransportInner::Socket(stream) => Pin::new(stream),
-            SshTransportInner::Command(child) => Pin::new(child.stdin.as_mut().unwrap()),
+            SshTransportInner::Command(child) => Pin::new(child.child.as_mut().unwrap().stdin.as_mut().unwrap()),
             SshTransportInner::SshChannel(stream) => Pin::new(stream),
             SshTransportInner::SocksProxy(stream) => Pin::new(stream),
         } {
@@ -181,7 +218,7 @@ impl AsyncWrite for SshTransportInner {
     delegate! {
         to match self {
             SshTransportInner::Socket(stream) => Pin::new(stream),
-            SshTransportInner::Command(child) => Pin::new(child.stdin.as_ref().unwrap()),
+            SshTransportInner::Command(child) => Pin::new(child.child.as_ref().unwrap().stdin.as_ref().unwrap()),
             SshTransportInner::SshChannel(stream) => Pin::new(stream),
             SshTransportInner::SocksProxy(stream) => Pin::new(stream),
         } {

@@ -69,6 +69,16 @@ class ChannelEventBuffer<T = void> {
 }
 
 export class ClientEventInterface {
+    private tickets = new WeakMap<Uint8Array, { channel: number, ticket: number }>()
+    private disconnected = false
+
+    takeDataTicket(channel: number, data: Uint8Array): number | null {
+        const entry = this.tickets.get(data)
+        if (!entry || entry.channel !== channel) { return null }
+        this.tickets.delete(data)
+        return entry.ticket
+    }
+
     data$ = new ChannelEventBuffer<Uint8Array>()
     extendedData$ = new ChannelEventBuffer<[number, Uint8Array]>()
     eof$ = new ChannelEventBuffer()
@@ -91,19 +101,25 @@ export class ClientEventInterface {
         this.banner$.complete()
     }
 
-    dataCallback = (_: unknown, channel: number, data: Uint8Array) => {
+    dataCallback = (_: unknown, channel: number, data: Uint8Array, ticket = 0) => {
+        if (this.disconnected) { return }
+        if (ticket) { this.tickets.set(data, { channel, ticket }) }
         this.data$.next(channel, data)
     }
 
-    extendedDataCallback = (_: unknown, channel: number, ext: number, data: Uint8Array) => {
+    extendedDataCallback = (_: unknown, channel: number, ext: number, data: Uint8Array, ticket = 0) => {
+        if (this.disconnected) { return }
+        if (ticket) { this.tickets.set(data, { channel, ticket }) }
         this.extendedData$.next(channel, [ext, data])
     }
 
     eofCallback = (_: unknown, channel: number) => {
+        if (this.disconnected) { return }
         this.eof$.next(channel)
     }
 
     closeCallback = (_: unknown, channel: number) => {
+        if (this.disconnected) { return }
         this.close$.next(channel)
         this.data$.closeChannel(channel)
         this.extendedData$.closeChannel(channel)
@@ -112,6 +128,8 @@ export class ClientEventInterface {
     }
 
     disconnectCallback = () => {
+        if (this.disconnected) { return }
+        this.disconnected = true
         this.disconnect$.next()
     }
 

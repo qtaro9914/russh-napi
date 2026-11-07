@@ -1,6 +1,6 @@
 {
   "name": "russh",
-  "version": "0.1.38-rw.1+0.60.1",
+  "version": "0.1.38-rw.2+0.60.1",
   "main": "lib/index.js",
   "license": "Apache-2.0",
   "dependencies": {
@@ -20,7 +20,8 @@
     "build:debug": "napi build --dts lib/native.d.ts --platform",
     "local": "npm run build && tsc",
     "local:debug": "npm run build:debug && tsc",
-    "prepublishOnly": "tsc"
+    "prepublishOnly": "tsc",
+    "test:regression": "cargo build --locked --example receive_flow_server && node --test tests/flow-and-cancellation.test.cjs"
   },
   "peerDependencies": {
     "rxjs": "^7"

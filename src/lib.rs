@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cancellation::CancellationStream;
 use channel::NewSshChannel;
 use key::{SshKeyPair, SshPublicKey};
 use log::debug;
@@ -11,15 +12,20 @@ use napi::bindgen_prelude::{Promise, Uint8Array};
 use napi::module_init;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
+use receive_flow::{ReceiveFlow, SshReceiveBufferStats};
 use russh::client::{AuthResult, DisconnectReason};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::{ChannelId, MethodSet};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use error::WrappedError;
 
 mod agent;
+mod cancellation;
+mod receive_flow;
+pub use cancellation::SshCancellation;
 mod channel;
 mod error;
 mod key;
@@ -39,9 +45,11 @@ fn init() {
 }
 
 pub struct SSHClientHandler {
+    cancellation: CancellationToken,
+    receive_flow: ReceiveFlow,
     pub server_key_callback: ThreadsafeFunction<SshPublicKey, Promise<bool>>,
-    pub data_callback: ThreadsafeFunction<(u32, Uint8Array)>,
-    pub extended_data_callback: ThreadsafeFunction<(u32, u32, Uint8Array)>,
+    pub data_callback: ThreadsafeFunction<(u32, Uint8Array, u32)>,
+    pub extended_data_callback: ThreadsafeFunction<(u32, u32, Uint8Array, u32)>,
     pub eof_callback: ThreadsafeFunction<u32>,
     pub close_callback: ThreadsafeFunction<u32>,
     pub disconnect_callback: ThreadsafeFunction<Option<napi::Error>>,
@@ -98,13 +106,17 @@ impl russh::client::Handler for SSHClientHandler {
         &mut self,
         server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
-        let response = self
-            .server_key_callback
-            .call_async(Ok(SshPublicKey::from(server_public_key.clone())))
-            .await?
-            .await?;
+        cancellation::run(&self.cancellation, async {
+            let response = self
+                .server_key_callback
+                .call_async(Ok(SshPublicKey::from(server_public_key.clone())))
+                .await?
+                .await?;
 
-        Ok(response)
+            Ok(response)
+        })
+        .await
+        .map_err(WrappedError::from)
     }
 
     async fn data(
@@ -113,10 +125,21 @@ impl russh::client::Handler for SSHClientHandler {
         data: &[u8],
         _session: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
-        self.data_callback.call(
-            Ok((channel.into(), data.into())),
+        let Some(ticket) = self
+            .receive_flow
+            .reserve(channel.into(), data.len(), &self.cancellation)
+            .await?
+        else {
+            return Ok(());
+        };
+        let status = self.data_callback.call(
+            Ok((channel.into(), data.into(), ticket)),
             ThreadsafeFunctionCallMode::NonBlocking,
         );
+        if status != napi::Status::Ok {
+            self.receive_flow.acknowledge(ticket);
+            return Err(napi::Error::new(status, "Could not enqueue SSH data").into());
+        }
         Ok(())
     }
 
@@ -127,10 +150,21 @@ impl russh::client::Handler for SSHClientHandler {
         data: &[u8],
         _session: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
-        self.extended_data_callback.call(
-            Ok((channel.into(), ext, data.into())),
+        let Some(ticket) = self
+            .receive_flow
+            .reserve(channel.into(), data.len(), &self.cancellation)
+            .await?
+        else {
+            return Ok(());
+        };
+        let status = self.extended_data_callback.call(
+            Ok((channel.into(), ext, data.into(), ticket)),
             ThreadsafeFunctionCallMode::NonBlocking,
         );
+        if status != napi::Status::Ok {
+            self.receive_flow.acknowledge(ticket);
+            return Err(napi::Error::new(status, "Could not enqueue SSH data").into());
+        }
         Ok(())
     }
 
@@ -139,6 +173,9 @@ impl russh::client::Handler for SSHClientHandler {
         channel: ChannelId,
         _session: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
+        self.receive_flow
+            .drain(channel.into(), &self.cancellation)
+            .await?;
         self.eof_callback
             .call(Ok(channel.into()), ThreadsafeFunctionCallMode::NonBlocking);
         Ok(())
@@ -149,6 +186,10 @@ impl russh::client::Handler for SSHClientHandler {
         channel: ChannelId,
         _session: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
+        self.receive_flow
+            .drain(channel.into(), &self.cancellation)
+            .await?;
+        self.receive_flow.close(channel.into(), false);
         self.close_callback
             .call(Ok(channel.into()), ThreadsafeFunctionCallMode::NonBlocking);
         Ok(())
@@ -158,6 +199,7 @@ impl russh::client::Handler for SSHClientHandler {
         &mut self,
         reason: DisconnectReason<Self::Error>,
     ) -> Result<(), Self::Error> {
+        self.receive_flow.clear();
         self.disconnect_callback.call(
             Ok(match reason {
                 DisconnectReason::Error(e) => Some(e.into()),
@@ -331,19 +373,41 @@ impl From<AuthResult> for SshAuthResult {
 #[napi]
 pub struct SshClient {
     handle: Arc<Mutex<russh::client::Handle<SSHClientHandler>>>,
+    cancellation: CancellationToken,
+    receive_flow: ReceiveFlow,
 }
 
 #[napi]
 impl SshClient {
     #[napi]
+    pub fn set_receive_buffer_limit(&self, channel: u32, limit: u32) -> napi::Result<()> {
+        self.receive_flow.configure(channel, limit)
+    }
+    #[napi]
+    pub fn acknowledge_received_data(&self, ticket: u32) -> bool {
+        self.receive_flow.acknowledge(ticket)
+    }
+    #[napi]
+    pub fn stop_receiving(&self, channel: u32) {
+        self.receive_flow.close(channel, true);
+    }
+    #[napi]
+    pub fn receive_buffer_stats(&self) -> SshReceiveBufferStats {
+        self.receive_flow.stats()
+    }
+
+    #[napi]
     pub async fn authenticate_none(&self, username: String) -> napi::Result<SshAuthResult> {
-        let mut handle = self.handle.lock().await;
-        handle
-            .authenticate_none(username)
-            .await
-            .map_err(WrappedError::from)
-            .map_err(Into::into)
-            .map(Into::into)
+        cancellation::run(&self.cancellation, async {
+            let mut handle = self.handle.lock().await;
+            handle
+                .authenticate_none(username)
+                .await
+                .map_err(WrappedError::from)
+                .map_err(Into::into)
+                .map(Into::into)
+        })
+        .await
     }
 
     #[napi]
@@ -352,13 +416,16 @@ impl SshClient {
         username: String,
         password: String,
     ) -> napi::Result<SshAuthResult> {
-        let mut handle = self.handle.lock().await;
-        handle
-            .authenticate_password(username, password)
-            .await
-            .map_err(WrappedError::from)
-            .map_err(Into::into)
-            .map(Into::into)
+        cancellation::run(&self.cancellation, async {
+            let mut handle = self.handle.lock().await;
+            handle
+                .authenticate_password(username, password)
+                .await
+                .map_err(WrappedError::from)
+                .map_err(Into::into)
+                .map(Into::into)
+        })
+        .await
     }
 
     #[napi]
@@ -368,25 +435,28 @@ impl SshClient {
         key: &SshKeyPair,
         hash_algorithm: Option<HashAlgorithm>,
     ) -> napi::Result<SshAuthResult> {
-        let mut handle: tokio::sync::MutexGuard<'_, russh::client::Handle<SSHClientHandler>> =
-            self.handle.lock().await;
-        let hash_algorithm = match hash_algorithm {
-            Some(x) => x.into(),
-            None => handle
-                .best_supported_rsa_hash()
+        cancellation::run(&self.cancellation, async {
+            let mut handle: tokio::sync::MutexGuard<'_, russh::client::Handle<SSHClientHandler>> =
+                self.handle.lock().await;
+            let hash_algorithm = match hash_algorithm {
+                Some(x) => x.into(),
+                None => handle
+                    .best_supported_rsa_hash()
+                    .await
+                    .map_err(WrappedError::from)?
+                    .flatten(),
+            };
+            handle
+                .authenticate_publickey(
+                    username,
+                    PrivateKeyWithHashAlg::new(Arc::new(key.inner.clone()), hash_algorithm),
+                )
                 .await
-                .map_err(WrappedError::from)?
-                .flatten(),
-        };
-        handle
-            .authenticate_publickey(
-                username,
-                PrivateKeyWithHashAlg::new(Arc::new(key.inner.clone()), hash_algorithm),
-            )
-            .await
-            .map_err(WrappedError::from)
-            .map_err(Into::into)
-            .map(Into::into)
+                .map_err(WrappedError::from)
+                .map_err(Into::into)
+                .map(Into::into)
+        })
+        .await
     }
 
     #[napi]
@@ -394,13 +464,16 @@ impl SshClient {
         &self,
         username: String,
     ) -> napi::Result<KeyboardInteractiveAuthenticationState> {
-        let mut handle = self.handle.lock().await;
-        handle
-            .authenticate_keyboard_interactive_start(username, None)
-            .await
-            .map_err(WrappedError::from)
-            .map_err(Into::into)
-            .map(Into::into)
+        cancellation::run(&self.cancellation, async {
+            let mut handle = self.handle.lock().await;
+            handle
+                .authenticate_keyboard_interactive_start(username, None)
+                .await
+                .map_err(WrappedError::from)
+                .map_err(Into::into)
+                .map(Into::into)
+        })
+        .await
     }
 
     #[napi]
@@ -408,13 +481,16 @@ impl SshClient {
         &self,
         responses: Vec<String>,
     ) -> napi::Result<KeyboardInteractiveAuthenticationState> {
-        let mut handle = self.handle.lock().await;
-        handle
-            .authenticate_keyboard_interactive_respond(responses)
-            .await
-            .map_err(WrappedError::from)
-            .map_err(Into::into)
-            .map(Into::into)
+        cancellation::run(&self.cancellation, async {
+            let mut handle = self.handle.lock().await;
+            handle
+                .authenticate_keyboard_interactive_respond(responses)
+                .await
+                .map_err(WrappedError::from)
+                .map_err(Into::into)
+                .map(Into::into)
+        })
+        .await
     }
 
     #[napi]
@@ -424,89 +500,106 @@ impl SshClient {
         connection: &AgentConnection,
         specific_key: Option<&SshPublicKey>,
     ) -> napi::Result<SshAuthResult> {
-        let mut handle = self.handle.lock().await;
+        cancellation::run(&self.cancellation, async {
+            let mut handle = self.handle.lock().await;
 
-        let mut agent = get_agent_client(connection).await?;
+            let mut agent = get_agent_client(connection).await?;
 
-        let keys = match specific_key {
-            Some(k) => {
-                debug!("Trying specified key {:?}", k.inner());
-                vec![k.inner().clone().into()]
-            }
-            None => agent
-                .request_identities()
-                .await
-                .map_err(WrappedError::from)?,
-        };
-
-        let mut last_auth_result = AuthResult::Failure {
-            remaining_methods: MethodSet::empty(),
-            partial_success: false,
-        };
-
-        let best_hash = handle
-            .best_supported_rsa_hash()
-            .await
-            .map_err(|e| napi::Error::from(WrappedError::from(e)))?
-            .flatten();
-
-        for key in keys {
-            debug!("Trying key {key:?}");
-            let result = match key {
-                AgentIdentity::PublicKey { key, .. } => {
-                    handle
-                        .authenticate_publickey_with(&username, key.clone(), best_hash, &mut agent)
-                        .await
+            let keys = match specific_key {
+                Some(k) => {
+                    debug!("Trying specified key {:?}", k.inner());
+                    vec![k.inner().clone().into()]
                 }
-                AgentIdentity::Certificate { certificate, .. } => {
-                    handle
-                        .authenticate_certificate_with(
-                            &username,
-                            certificate,
-                            best_hash,
-                            &mut agent,
-                        )
-                        .await
-                }
+                None => agent
+                    .request_identities()
+                    .await
+                    .map_err(WrappedError::from)?,
             };
-            let ret = result.map_err(|e| napi::Error::from(WrappedError::from(e)))?;
-            if ret.success() {
-                return Ok(ret.into());
-            }
-            last_auth_result = ret;
-        }
 
-        Ok(last_auth_result.into())
+            let mut last_auth_result = AuthResult::Failure {
+                remaining_methods: MethodSet::empty(),
+                partial_success: false,
+            };
+
+            let best_hash = handle
+                .best_supported_rsa_hash()
+                .await
+                .map_err(|e| napi::Error::from(WrappedError::from(e)))?
+                .flatten();
+
+            for key in keys {
+                debug!("Trying key {key:?}");
+                let result = match key {
+                    AgentIdentity::PublicKey { key, .. } => {
+                        handle
+                            .authenticate_publickey_with(
+                                &username,
+                                key.clone(),
+                                best_hash,
+                                &mut agent,
+                            )
+                            .await
+                    }
+                    AgentIdentity::Certificate { certificate, .. } => {
+                        handle
+                            .authenticate_certificate_with(
+                                &username,
+                                certificate,
+                                best_hash,
+                                &mut agent,
+                            )
+                            .await
+                    }
+                };
+                let ret = result.map_err(|e| napi::Error::from(WrappedError::from(e)))?;
+                if ret.success() {
+                    return Ok(ret.into());
+                }
+                last_auth_result = ret;
+            }
+
+            Ok(last_auth_result.into())
+        })
+        .await
     }
 
     #[napi]
     pub async fn channel_open_session(&self) -> napi::Result<NewSshChannel> {
-        let handle = self.handle.lock().await;
-        let ch = handle
-            .channel_open_session()
-            .await
-            .map_err(WrappedError::from)?;
-        Ok(ch.into())
+        cancellation::run(&self.cancellation, async {
+            let handle = self.handle.lock().await;
+            let ch = handle
+                .channel_open_session()
+                .await
+                .map_err(WrappedError::from)?;
+            Ok(ch.into())
+        })
+        .await
     }
 
     #[napi]
     pub async fn tcpip_forward(&self, address: String, port: u32) -> napi::Result<u32> {
-        let handle = self.handle.lock().await;
-        let port = handle
-            .tcpip_forward(address, port)
-            .await
-            .map_err(WrappedError::from)?;
-        Ok(port)
+        cancellation::run(&self.cancellation, async {
+            let handle = self.handle.lock().await;
+            let port = handle
+                .tcpip_forward(address, port)
+                .await
+                .map_err(WrappedError::from)?;
+            Ok(port)
+        })
+        .await
     }
 
     #[napi]
     pub async fn cancel_tcpip_forward(&self, address: String, port: u32) -> napi::Result<()> {
-        let handle = self.handle.lock().await;
-        handle
-            .cancel_tcpip_forward(address, port)
-            .await
-            .map_err(WrappedError::from)?;
-        Ok(())
+        cancellation::run(&self.cancellation, async {
+            let handle = self.handle.lock().await;
+            handle
+                .cancel_tcpip_forward(address, port)
+                .await
+                .map_err(WrappedError::from)?;
+            Ok(())
+        })
+        .await
     }
 
     #[napi]
@@ -517,21 +610,23 @@ impl SshClient {
         originator_address: String,
         originator_port: u32,
     ) -> napi::Result<NewSshChannel> {
-        let handle = self.handle.lock().await;
-        let ch = handle
-            .channel_open_direct_tcpip(address, port, originator_address, originator_port)
-            .await
-            .map_err(WrappedError::from)?;
-        Ok(ch.into())
+        cancellation::run(&self.cancellation, async {
+            let handle = self.handle.lock().await;
+            let ch = handle
+                .channel_open_direct_tcpip(address, port, originator_address, originator_port)
+                .await
+                .map_err(WrappedError::from)?;
+            Ok(ch.into())
+        })
+        .await
     }
 
     #[napi]
     pub async fn disconnect(&self) -> napi::Result<()> {
-        let handle = self.handle.lock().await;
-        handle
-            .disconnect(russh::Disconnect::ByApplication, "", "")
-            .await
-            .map_err(WrappedError::from)?;
+        // Authentication may hold the handle mutex indefinitely. Cancel I/O
+        // directly, without waiting for that lock or a peer acknowledgement.
+        self.cancellation.cancel();
+        self.receive_flow.clear();
         Ok(())
     }
 }
@@ -549,8 +644,8 @@ pub async fn connect(
     keepalive_interval_seconds: Option<u32>,
     keepalive_max: u32,
     server_key_callback: ThreadsafeFunction<SshPublicKey, Promise<bool>>,
-    data_callback: ThreadsafeFunction<(u32, Uint8Array)>,
-    extended_data_callback: ThreadsafeFunction<(u32, u32, Uint8Array)>,
+    data_callback: ThreadsafeFunction<(u32, Uint8Array, u32)>,
+    extended_data_callback: ThreadsafeFunction<(u32, u32, Uint8Array, u32)>,
     eof_callback: ThreadsafeFunction<u32>,
     close_callback: ThreadsafeFunction<u32>,
     disconnect_callback: ThreadsafeFunction<Option<napi::Error>>,
@@ -558,10 +653,15 @@ pub async fn connect(
     tcpip_channel_open_callback: ThreadsafeFunction<(NewSshChannel, String, u32, String, u32)>,
     agent_channel_open_callback: ThreadsafeFunction<NewSshChannel>,
     banner_callback: ThreadsafeFunction<String>,
+    cancellation: Option<&SshCancellation>,
 ) -> napi::Result<SshClient> {
+    let cancellation = cancellation::token(cancellation);
+    let receive_flow = ReceiveFlow::default();
     debug!("russh-napi connecting to {transport:?}");
 
     let handler = SSHClientHandler {
+        cancellation: cancellation.clone(),
+        receive_flow: receive_flow.clone(),
         server_key_callback,
         data_callback,
         extended_data_callback,
@@ -626,19 +726,29 @@ pub async fn connect(
         ));
     };
 
-    let connection_fut = russh::client::connect_stream(Arc::new(cfg), transport, handler);
-    let handle = if let Some(connection_timeout_seconds) = connection_timeout_seconds {
-        tokio::time::timeout(
-            Duration::from_secs(connection_timeout_seconds as u64),
-            connection_fut,
-        )
-        .await
-        .map_err(|_| napi::Error::new(napi::Status::GenericFailure, "Connection timeout"))?
-    } else {
-        connection_fut.await
-    }?;
+    let transport = CancellationStream::new(transport, cancellation.clone());
+    let result = cancellation::run(&cancellation, async {
+        let connection_fut = russh::client::connect_stream(Arc::new(cfg), transport, handler);
+        let handle = if let Some(connection_timeout_seconds) = connection_timeout_seconds {
+            tokio::time::timeout(
+                Duration::from_secs(connection_timeout_seconds as u64),
+                connection_fut,
+            )
+            .await
+            .map_err(|_| napi::Error::new(napi::Status::GenericFailure, "Connection timeout"))?
+        } else {
+            connection_fut.await
+        }?;
 
-    Ok(SshClient {
-        handle: Arc::new(Mutex::new(handle)),
+        Ok(SshClient {
+            handle: Arc::new(Mutex::new(handle)),
+            cancellation: cancellation.clone(),
+            receive_flow,
+        })
     })
+    .await;
+    if result.is_err() {
+        cancellation.cancel();
+    }
+    result
 }

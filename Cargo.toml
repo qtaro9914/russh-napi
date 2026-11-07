@@ -33,6 +33,11 @@ env_logger = "0.11"
 tokio-socks = "0.5.2"
 async-http-proxy = { version = "1.2.5", features = ["runtime-tokio"] }
 
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+rand = { version = "0.10", features = ["thread_rng"] }
+
 [build-dependencies]
 napi-build = "2"
 

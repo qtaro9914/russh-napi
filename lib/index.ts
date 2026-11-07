@@ -4,7 +4,7 @@ import { SFTP } from './sftp'
 import { Channel, NewChannel } from './channel'
 import { ClientEventInterface } from './events'
 
-import russh, { SshKeyPair, KeyboardInteractiveAuthenticationPrompt, SshClient, SshChannel, SshPublicKey, SshTransport, HashAlgorithm } from './native'
+import russh, { SshKeyPair, KeyboardInteractiveAuthenticationPrompt, SshClient, SshChannel, SshPublicKey, SshTransport, SshCancellation, HashAlgorithm } from './native'
 import { AgentConnectionSpec, makeRusshAgentConnection } from './agent'
 
 export class KeyPair {
@@ -49,6 +49,7 @@ export interface AuthFailure {
 }
 
 export interface Config {
+    cancellation?: SshCancellation,
     preferred?: {
         ciphers?: string[]
         kex?: string[],
@@ -76,27 +77,34 @@ export class SSHClient extends Destructible {
         config?: Config,
     ): Promise<SSHClient> {
         const eventInterface = new ClientEventInterface()
-        const russhClient = await russh.connect(
-            transport,
-            config?.preferred?.ciphers,
-            config?.preferred?.kex,
-            config?.preferred?.key,
-            config?.preferred?.mac,
-            config?.preferred?.compression,
-            config?.connectionTimeoutSeconds,
-            config?.keepaliveIntervalSeconds,
-            config?.keepaliveCountMax ?? 3,
-            (_, k) => serverKeyCallback(k),
-            eventInterface.dataCallback,
-            eventInterface.extendedDataCallback,
-            eventInterface.eofCallback,
-            eventInterface.closeCallback,
-            eventInterface.disconnectCallback,
-            eventInterface.x11ChannelOpenCallback,
-            eventInterface.tcpChannelOpenCallback,
-            eventInterface.agentChannelOpenCallback,
-            eventInterface.bannerCallback,
-        )
+        let russhClient: SshClient
+        try {
+            russhClient = await russh.connect(
+                transport,
+                config?.preferred?.ciphers,
+                config?.preferred?.kex,
+                config?.preferred?.key,
+                config?.preferred?.mac,
+                config?.preferred?.compression,
+                config?.connectionTimeoutSeconds,
+                config?.keepaliveIntervalSeconds,
+                config?.keepaliveCountMax ?? 3,
+                (_, k) => serverKeyCallback(k),
+                eventInterface.dataCallback,
+                eventInterface.extendedDataCallback,
+                eventInterface.eofCallback,
+                eventInterface.closeCallback,
+                eventInterface.disconnectCallback,
+                eventInterface.x11ChannelOpenCallback,
+                eventInterface.tcpChannelOpenCallback,
+                eventInterface.agentChannelOpenCallback,
+                eventInterface.bannerCallback,
+                config?.cancellation,
+            )
+        } catch (error) {
+            eventInterface.complete()
+            throw error
+        }
 
         eventInterface.disconnect$.subscribe(() => {
             setTimeout(() => eventInterface.complete())
@@ -201,7 +209,12 @@ export class SSHClient extends Destructible {
 
     async disconnect(): Promise<void> {
         this.destruct()
-        await this.client.disconnect()
+        try {
+            await this.client.disconnect()
+        } finally {
+            this.events.disconnectCallback()
+            this.events.complete()
+        }
     }
 
     private intoAuthenticated(): AuthenticatedSSHClient {
@@ -280,7 +293,16 @@ export class AuthenticatedSSHClient extends Destructible {
 
     async disconnect(): Promise<void> {
         this.destruct()
-        await this.client.disconnect()
+        try {
+            await this.client.disconnect()
+        } finally {
+            this.events.disconnectCallback()
+            this.events.complete()
+        }
+    }
+
+    receiveBufferStats() {
+        return this.client.receiveBufferStats()
     }
 
     async activateChannel (ch: NewChannel): Promise<Channel> {
@@ -295,7 +317,7 @@ export class AuthenticatedSSHClient extends Destructible {
 
     private async wrapChannel(channel: SshChannel): Promise<Channel> {
         let id = await channel.id()
-        return new Channel(id, channel, this.events)
+        return new Channel(id, channel, this.events, this.client)
     }
 }
 
@@ -303,6 +325,7 @@ export {
     KeyboardInteractiveAuthenticationPrompt,
     SshPublicKey,
     SshTransport,
+    SshCancellation,
     SshChannel,
     NewSshChannel,
     SftpFileType as SFTPFileType,
