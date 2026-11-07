@@ -39,7 +39,8 @@ export class Channel extends Destructible {
     constructor(
         public readonly id: number,
         private inner: russh.SshChannel,
-        events: ClientEventInterface,
+        private events: ClientEventInterface,
+        private owner?: russh.SshClient,
     ) {
         super()
         this.data$ = events.data$.subscribe(id)
@@ -50,6 +51,7 @@ export class Channel extends Destructible {
 
     async take(): Promise<russh.SshChannel> {
         this.assertNotDestructed()
+        this.owner?.setReceiveBufferLimit(this.id, 0)
         this.destruct()
         return this.inner
     }
@@ -113,6 +115,27 @@ export class Channel extends Destructible {
     }
 
     async close(): Promise<void> {
+        this.owner?.stopReceiving(this.id)
         await this.inner.close()
     }
+    /**
+     * Opt in before requesting output. ACK each original stdout/stderr chunk
+     * after consumption. A full budget pauses the shared SSH connection.
+     * Zero restores legacy unthrottled delivery.
+     */
+    setReceiveBufferLimit(bytes: number): void {
+        this.assertNotDestructed()
+        if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > 8 * 1024 * 1024) {
+            throw new RangeError('Receive limit must be an integer between 0 and 8 MiB')
+        }
+        if (!this.owner) { throw new Error('Channel has no receive controller') }
+        this.owner.setReceiveBufferLimit(this.id, bytes)
+    }
+
+    /** ACK exactly once, using the original received array. */
+    acknowledgeData(data: Uint8Array): boolean {
+        const ticket = this.events.takeDataTicket(this.id, data)
+        return ticket !== null && (this.owner?.acknowledgeReceivedData(ticket) ?? false)
+    }
+
 }

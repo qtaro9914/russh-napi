@@ -20,7 +20,8 @@
     "build:debug": "napi build --dts lib/native.d.ts --platform",
     "local": "npm run build && tsc",
     "local:debug": "npm run build:debug && tsc",
-    "prepublishOnly": "tsc"
+    "prepublishOnly": "tsc",
+    "test:regression": "cargo build --locked --example receive_flow_server && node --test tests/flow-and-cancellation.test.cjs"
   },
   "peerDependencies": {
     "rxjs": "^7"
